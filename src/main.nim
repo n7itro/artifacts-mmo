@@ -1,138 +1,237 @@
-{.push discardable.}
+{.push discardable, thread, 
+experimental: "dotOperators".}
 
+import threadpool, httpclient, json, macros
+
+from sequtils import filterIt
 from os import sleep
 from strformat import fmt
-import json, httpclient
 
 const 
+    # TODO: environment variables
     token = ""
-    user = ""
-    site = "https://api.artifactsmmo.com"
 
-let client = newHttpClient(headers = newHttpHeaders(
-    {"Accept": "application/json",
-    "Content-Type": "application/json",
-    "Authorization": "Bearer " & token})) 
+    headers = (
+        {"Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " & token})
 
-proc cooldown: int =
-    let data = readFile("character.json").parseJson
-    data["cooldown"].num * 1000
+    grandExchange = (5, 1)
+    bank = (4, 1)
+    tasksMaster = (1, 2)
 
+# Syntactic sugar for json key access with dot notation
+# e.g. data.field instead of data["field"] 
+macro `.`(obj: JsonNode, field: untyped): untyped =
+    let fieldName = $field
+    quote do: 
+        `obj`[`fieldname`]
+
+type 
+    Username = enum user, user2, user3, user4, user5
+
+    User = object
+        name: Username
+        client: HttpClient
+
+# Forward declaration
+proc action(user: User, endpoint: string, payload = %* ""): JsonNode
+proc moveTo(user: User, pos: (int, int)): JsonNode
+
+proc config(user: User): JsonNode =
+    parseJson readFile ($ user.name & ".json")
+
+proc wait(user: User) =
+    sleep user.config.cooldown.num * 1000
+
+# Deposit every item in inventory
+proc depositAll(user: User) =
+    user.moveTo(bank)
+
+    let items = user.config
+        .inventory
+        .filterIt it.quantity.num > 0
+
+    for item in items:
+        user.action "bank/deposit", %* {
+            "code": item.code.str,
+            "quantity": item.quantity.num
+        }
+
+# Update the current character details
+proc update(user: User, data: JsonNode) =
+    writeFile(
+        $ user.name & ".json", 
+        pretty data)
+
+proc handleError(user: User, response: JsonNode, endpoint: string, payload = %* ""): JsonNode =
+    case response.error.code.num
+    # Server lagging
+    of 486, 502:
+        sleep 3_000
+        user.action(endpoint, payload)
+
+    # Inventory full
+    of 497:
+        user.depositAll()
+        user.action(endpoint, payload)
+
+    else: echo fmt"{user.name} - {response.error.message} on {endpoint}"
+
+# FIXME: Error handling
 proc getJson(endpoint: string): JsonNode =
-    client.request(
-        fmt"{site}/{endpoint}", 
-        HttpGet
-    ).body.parseJson["data"]
+    newHttpClient(headers = newHttpHeaders headers)
+        .request(fmt"https://api.artifactsmmo.com/{endpoint}", HttpGet)
+        .body
+        .parseJson
+        .data
 
-proc action(endpoint: string, payload = %* ""): JsonNode =
-    result = client.request(
-        fmt"{site}/my/{user}/action/{endpoint}", 
+proc action(user: User, endpoint: string, payload = %* ""): JsonNode =
+    result = user.client.request(
+        fmt"https://api.artifactsmmo.com/my/{user.name}/action/{endpoint}", 
         HttpPost, 
-        $payload
-    ).body.parseJson
+        $payload).body.parseJson
 
     if result.contains("error"):
-        # Server lagging
-        if result["error"]["code"].num == 486:
-            sleep 5_000
-            result = action(endpoint, payload)
-
-    # Update the current character details
-    else:
-        let charData = result["data"]["character"]
-        writeFile "character.json", $pretty charData
+        return user.handleError(result, endpoint, payload)
     
-    sleep cooldown()
+    user.update result.data.character
+    user.wait
 
-proc hasDrop(dropType, item: string): string =
-    getJson(fmt"{dropType}/?drop={item}")[0]["code"].str
-
-# Harvest resources on current map
-proc gather(dropType: string): JsonNode =
-    if dropType == "monsters":
-        action("fight")["data"]["fight"]["drops"]
-    else:
-        action("gathering")["data"]["details"]["items"]
-
-proc craft(item: string, quantity = 1): JsonNode =
-    let item = %* {
-        "code": item
-    }
-    for i in 0..quantity:
-        action "crafting", item
-
-proc unequip(slot: string): JsonNode =
-    let slot = %* {
-        "slot": slot
-    }
-    action "unequip", slot
-
-proc equip(code, slot: string): JsonNode =
-    let item = %* {
-        "code": code,
-        "slot": slot
-    }
-    unequip slot
-    action "equip", item
-
-proc moveTo(pos: (int, int)): JsonNode =
-    let position = %* {
+proc moveTo(user: User, pos: (int, int)): JsonNode =
+    user.action "move", %* {
         "x": pos[0],
         "y": pos[1]
     }
-    action "move", position
+
+proc craft(user: User, item: string, quantity = 1): JsonNode =
+    user.action "crafting", %* {
+        "code": item,
+        "quantity": quantity
+    }
+
+proc equip(user: User, code, slot: string): JsonNode =
+    # Empty the slot
+    user.action "unequip", %* {
+        "slot": slot
+    }
+    
+    user.action "equip", %* {
+        "code": code,
+        "slot": slot
+    }
 
 # Return the amount of an item in the inventory
-proc currentAmount(code: string): int =
-    let inventory = readFile("character.json").parseJson["inventory"]
-
-    for item in inventory:
-        if item["code"].str == code:
-            return item["quantity"].num
-
-proc inventoryFull(): bool = discard
-
-proc depositAll() = discard
-
-# Return the coordinates of a map that contains the resource
+proc hasAmount(user: User, code: string): int =
+    for item in user.config.inventory:
+        if item.code.str == code:
+            return item.quantity.num
+        
+# Return coordinates of a map that contains the resource
 proc location(resource: string): (int, int) =
     let map = getJson(fmt"maps/?content_code={resource}")[0]
-    return (map["x"].getInt, map["y"].getInt)
+    (map.x.getInt, map.y.getInt)
 
-proc get(itemCode: string, quantity: int) =
-    if inventoryFull():
-        depositAll()
+# Harvest resources on current map
+proc harvest(user: User, dropType = "monsters"): JsonNode =
+    case dropType
+    of "monsters":
+        user.action("fight").data.fight.drops
+    else:
+        user.action("gathering").data.details.items
 
-    var item = getJson(fmt"items/{itemCode}")["item"]
+proc fight(user: User, monster: string, quantity: int) =
+    user.moveTo(location monster)
 
-    if item["craft"].kind != JNull:
-        for items in item["craft"]["items"]:
-            let neededAmount = items["quantity"].num * quantity 
-            let newItem = items["code"].str
+    for i in 0..quantity: 
+        user.harvest
 
-            if newItem.currentAmount < neededAmount:
-                get(newItem, neededAmount - newItem.currentAmount)
-                
-        let skillUsed = item["craft"]["skill"].str
-        moveTo location skillUsed
-        craft itemCode, quantity
+proc recycle(user: User, code: string, quantity = 1) =
+    let requiredSkill = getJson(fmt"items/{code}").item.skill
+    user.moveTo location requiredSkill.str
+
+    user.action "recycling", %* {
+        "code": code,
+        "quantity": quantity
+    }
+
+# Returns the current task objective and the progress left to do
+proc task(user: User): tuple[target: string, todo: int] =
+    (user.config.task.str,
+    int user.config.task_total.num - user.config.task_progress.num)
+
+proc newTask(user: User) =
+    user.moveTo(tasksMaster)
+    
+    if user.task.target != "":
+        user.action("task/complete")
+
+    user.action("task/new")
+
+proc doTask(user: User) =
+    if user.task.todo == 0:
+        user.newTask
+    
+    user.fight(user.task.target, user.task.todo)
+    user.newTask
+
+proc get(user: User, itemCode: string, quantity: int, recycle = false) =
+    var item = getJson(fmt"items/{itemCode}").item
+
+    # If the item doesn't have a craft, it's a resource
+    if item.craft.kind == JNull:
+        # FIXME: Check bank for the resource
+
+        # Decide which endpiont to use ("/resources/" or "/monsters/")
+        let dropType = case item.subtype.str
+            of "mob", "food": "monsters"
+            else: "resources"
+
+        # Get the first map that drops the resource
+        # TODO: get closest map
+        let map = getJson(fmt"{dropType}/?drop={item.code.str}")[0]
+        user.moveTo location map.code.str
+
+        # Gather the resource
+        var gathered = 0
+        while gathered < quantity:   
+            for drop in user.harvest(dropType):
+                if drop.code.str == itemCode:
+                    gathered += drop.quantity.num
         return
 
-    let map = 
-        if item["subtype"].str in ["mob", "food"]:
-            "monsters"
-        else:
-            "resources"
+    let
+        requiredItems = item.craft.items
+        requiredSkill = item.craft.skill.str
 
-    moveTo location map.hasDrop(itemCode)
+    for item in requiredItems:
+        let currentAmount = user.hasAmount(item.code.str)
+        let neededAmount  = item.quantity.num * quantity - currentAmount
 
-    var gathered = 0
-    while gathered < quantity:    
-        for drop in map.gather:
-            if drop["code"].str == itemCode:
-                inc gathered
+        if neededAmount > 0:
+            user.get(item.code.str, neededAmount)
     
-proc main = discard
+    # Move to the correct workshop for the skill
+    user.moveTo(location requiredSkill)
+    user.craft(itemCode, quantity)
+    
+    if recycle:
+        user.recycle(itemCode, quantity)
+
+proc init(user: User) =
+    user.update getJson(fmt"characters/{user.name}")
+
+    while true:
+        user.get("cooked_gudgeon", 20)
+
+proc main() =
+    for name in Username:
+        spawn User(
+                name: name,
+                client: newHttpClient(headers = newHttpHeaders(headers))
+        ).init
+    
+    sync()
 
 when isMainModule:
     main()
