@@ -175,44 +175,42 @@ proc doTask(user: User) =
     user.fight(user.task.target, user.task.todo)
     user.newTask
 
+proc gather(user: User, item: JsonNode, quantity: int) =
+    # FIXME: Check bank for the resource
+    # Decide which endpiont to use ("/resources/" or "/monsters/")
+    let dropType = case item.subtype.str
+        of "mob", "food": "monsters"
+        else: "resources"
+
+    # Get the first map that drops the resource - TODO: get closest map
+    let map = getJson(fmt"{dropType}/?drop={item.code.str}")[0]
+    user.moveTo location map.code.str
+
+    # Gather the resource
+    var gathered = 0
+    while gathered < quantity:   
+        for drop in user.harvest(dropType):
+            if drop.code == item.code:
+                gathered += drop.quantity.num
+
 proc get(user: User, itemCode: string, quantity: int, recycle = false) =
     var item = getJson(fmt"items/{itemCode}").item
 
     # If the item doesn't have a craft, it's a resource
     if item.craft.kind == JNull:
-        # FIXME: Check bank for the resource
+        user.gather(item, quantity)
 
-        # Decide which endpiont to use ("/resources/" or "/monsters/")
-        let dropType = case item.subtype.str
-            of "mob", "food": "monsters"
-            else: "resources"
-
-        # Get the first map that drops the resource
-        # TODO: get closest map
-        let map = getJson(fmt"{dropType}/?drop={item.code.str}")[0]
-        user.moveTo location map.code.str
-
-        # Gather the resource
-        var gathered = 0
-        while gathered < quantity:   
-            for drop in user.harvest(dropType):
-                if drop.code.str == itemCode:
-                    gathered += drop.quantity.num
-        return
-
-    let
-        requiredItems = item.craft.items
-        requiredSkill = item.craft.skill.str
-
-    for item in requiredItems:
+    for requiredItem in item.craft.items:
         let currentAmount = user.hasAmount(item.code.str)
-        let neededAmount  = item.quantity.num * quantity - currentAmount
+        let neededAmount  = requiredItem.quantity.num * quantity - currentAmount
 
         if neededAmount > 0:
-            user.get(item.code.str, neededAmount)
+            user.get(requiredItem.code.str, neededAmount)
     
     # Move to the correct workshop for the skill
+    let requiredSkill = item.craft.skill.str
     user.moveTo(location requiredSkill)
+    
     user.craft(itemCode, quantity)
     
     if recycle:
