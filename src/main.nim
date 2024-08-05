@@ -21,11 +21,14 @@ const
     tasksMaster = (1, 2)
 
 # Syntactic sugar for json key access with dot notation
-# e.g. data.field instead of data["field"] 
+# e.g. json.field instead of json["field"] 
 macro `.`(obj: JsonNode, field: untyped): untyped =
     let fieldName = $field
     quote do: 
-        `obj`[`fieldname`]
+        if `fieldName` == "first":
+            `obj`["data"][0]
+        else:
+            `obj`[`fieldName`]
 
 type 
     Username = enum user, user2, user3, user4, user5
@@ -44,7 +47,6 @@ proc config(user: User): JsonNode =
 proc wait(user: User) =
     sleep user.config.cooldown.num * 1000
 
-# Deposit every item in inventory
 proc depositAll(user: User) =
     user.moveTo(bank)
 
@@ -57,6 +59,10 @@ proc depositAll(user: User) =
             "code": item.code.str,
             "quantity": item.quantity.num
         }
+    
+    user.action "bank/deposit/gold", %* {
+        "quantity": user.config.gold.num
+    }
 
 # Update the current character details
 proc update(user: User, data: JsonNode) =
@@ -64,36 +70,38 @@ proc update(user: User, data: JsonNode) =
         $ user.name & ".json", 
         pretty data)
 
-proc handleError(user: User, response: JsonNode, endpoint: string, payload = %* ""): JsonNode =
+proc handleError(response: JsonNode, user: User, endpoint: string, payload = %* ""): JsonNode =
     case response.error.code.num
     # Server lagging
     of 486, 502:
         sleep 3_000
         user.action(endpoint, payload)
-
+        
     # Inventory full
     of 497:
         user.depositAll()
         user.action(endpoint, payload)
 
+    # Character in cooldown
+    of 499:
+        user.wait
+
     else: echo fmt"{user.name} - {response.error.message} on {endpoint}"
 
-# FIXME: Error handling
 proc getJson(endpoint: string): JsonNode =
     newHttpClient(headers = newHttpHeaders headers)
-        .request(fmt"https://api.artifactsmmo.com/{endpoint}", HttpGet)
+        .request(fmt"{api}/{endpoint}", HttpGet)
         .body
         .parseJson
-        .data
 
 proc action(user: User, endpoint: string, payload = %* ""): JsonNode =
     result = user.client.request(
-        fmt"https://api.artifactsmmo.com/my/{user.name}/action/{endpoint}", 
+        fmt"{api}/my/{user.name}/action/{endpoint}", 
         HttpPost, 
         $payload).body.parseJson
-
+    
     if result.contains("error"):
-        return user.handleError(result, endpoint, payload)
+        return result.handleError(user, endpoint, payload)
     
     user.update result.data.character
     user.wait
@@ -104,13 +112,14 @@ proc moveTo(user: User, pos: (int, int)): JsonNode =
         "y": pos[1]
     }
 
-proc craft(user: User, item: string, quantity = 1): JsonNode =
+proc craft(user: User, code: string, quantity = 1): JsonNode =
     user.action "crafting", %* {
-        "code": item,
+        "code": code,
         "quantity": quantity
     }
 
 proc equip(user: User, code, slot: string): JsonNode =
+    # TODO: Get or withdraw item if not in inventory
     # Empty the slot
     user.action "unequip", %* {
         "slot": slot
@@ -122,14 +131,14 @@ proc equip(user: User, code, slot: string): JsonNode =
     }
 
 # Return the amount of an item in the inventory
-proc hasAmount(user: User, code: string): int =
+proc hasAmount(user: User, target: JsonNode): int =
     for item in user.config.inventory:
-        if item.code.str == code:
+        if item.code.str == target.code.str:
             return item.quantity.num
         
 # Return coordinates of a map that contains the resource
 proc location(resource: string): (int, int) =
-    let map = getJson(fmt"maps/?content_code={resource}")[0]
+    let map = getJson(fmt"maps/?content_code={resource}").first
     (map.x.getInt, map.y.getInt)
 
 # Harvest resources on current map
@@ -147,7 +156,7 @@ proc fight(user: User, monster: string, quantity: int) =
         user.harvest
 
 proc recycle(user: User, code: string, quantity = 1) =
-    let requiredSkill = getJson(fmt"items/{code}").item.skill
+    let requiredSkill = getJson(fmt"items/{code}").data.item.skill
     user.moveTo location requiredSkill.str
 
     user.action "recycling", %* {
@@ -177,13 +186,13 @@ proc doTask(user: User) =
 
 proc gather(user: User, item: JsonNode, quantity: int) =
     # FIXME: Check bank for the resource
-    # Decide which endpiont to use ("/resources/" or "/monsters/")
+    # Decide which endpiont to use (/resources/ or /monsters/)
     let dropType = case item.subtype.str
         of "mob", "food": "monsters"
         else: "resources"
 
     # Get the first map that drops the resource - TODO: get closest map
-    let map = getJson(fmt"{dropType}/?drop={item.code.str}")[0]
+    let map = getJson(fmt"{dropType}/?drop={item.code.str}").first
     user.moveTo location map.code.str
 
     # Gather the resource
@@ -193,28 +202,27 @@ proc gather(user: User, item: JsonNode, quantity: int) =
             if drop.code == item.code:
                 gathered += drop.quantity.num
 
-proc get(user: User, itemCode: string, quantity: int, recycle = false) =
-    var item = getJson(fmt"items/{itemCode}").item
+proc get(user: User, itemCode: string, totalQuantity: int, recycle = false) =
+    var item = getJson(fmt"items/{itemCode}").data.item
 
     # If the item doesn't have a craft, it's a resource
     if item.craft.kind == JNull:
-        user.gather(item, quantity)
+        user.gather(item, totalQuantity)
+        return
 
-    for requiredItem in item.craft.items:
-        let currentAmount = user.hasAmount(item.code.str)
-        let neededAmount  = requiredItem.quantity.num * quantity - currentAmount
-
+    for requiredItem in JsonNode item.craft.items:
+        let neededAmount = requiredItem.quantity.num * totalQuantity - user.hasAmount(requiredItem)
         if neededAmount > 0:
             user.get(requiredItem.code.str, neededAmount)
     
     # Move to the correct workshop for the skill
     let requiredSkill = item.craft.skill.str
-    user.moveTo(location requiredSkill)
+    user.moveTo location requiredSkill
     
-    user.craft(itemCode, quantity)
+    user.craft itemCode, totalQuantity
     
-    if recycle:
-        user.recycle(itemCode, quantity)
+    if recycle: 
+        user.recycle itemCode, totalQuantity
 
 proc init(user: User) =
     user.update getJson(fmt"characters/{user.name}")
